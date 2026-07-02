@@ -35,7 +35,11 @@ BASE_BACKOFF_SECONDS = 5  # backoff naik: 5s, 10s, 20s...
 
 # Model fallback jika model utama kena limit (dari yang paling "berat" ke "ringan")
 GEMINI_FALLBACK_CHAIN = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
-GROQ_FALLBACK_CHAIN = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+# CATATAN (per Juli 2026): llama-3.3-70b-versatile, llama-3.1-8b-instant, gemma2-9b-it,
+# dan llama-4-scout/maverick (model vision) SUDAH DIPENSIUNKAN oleh Groq (17 Juni 2026).
+# Model aktif saat ini: openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b.
+# Groq BELUM punya model vision gratis pengganti Llama 4 Scout — vision tetap pakai Gemini.
+GROQ_FALLBACK_CHAIN = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -95,8 +99,9 @@ with st.sidebar:
     st.divider()
     groq_model = st.selectbox(
         "Model Diagnosis Agent (Groq)",
-        ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"],
+        ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"],
         index=0,
+        help="Model lama (llama-3.3-70b-versatile dkk) sudah dipensiunkan Groq per Juni 2026.",
     )
     gemini_model_name = st.selectbox(
         "Model Vision Agent (Gemini)",
@@ -114,7 +119,10 @@ with st.sidebar:
     st.caption(
         "**Arsitektur Agentic:**\n\n"
         "🖼️ Vision Agent (Gemini) → mengekstrak gejala visual dari foto\n\n"
-        "🩺 Diagnosis Agent (Groq) → menyusun Kartu Diagnosis final"
+        "🩺 Diagnosis Agent (Groq) → menyusun Kartu Diagnosis final\n\n"
+        "ℹ️ *Catatan: Groq belum menyediakan model vision gratis "
+        "(Llama 4 Scout/Maverick sudah dipensiunkan per Juni 2026), "
+        "jadi analisis gambar tetap memakai Gemini.*"
     )
 
 # ------------------------------------------------------------------
