@@ -23,8 +23,26 @@ Alur Agentic:
 import streamlit as st
 from PIL import Image
 import io
+import time
 
 from prompts import VISION_AGENT_PROMPT, DIAGNOSIS_AGENT_PROMPT
+
+# ------------------------------------------------------------------
+# KONSTANTA RETRY
+# ------------------------------------------------------------------
+MAX_RETRIES = 3
+BASE_BACKOFF_SECONDS = 5  # backoff naik: 5s, 10s, 20s...
+
+# Model fallback jika model utama kena limit (dari yang paling "berat" ke "ringan")
+GEMINI_FALLBACK_CHAIN = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+GROQ_FALLBACK_CHAIN = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Deteksi error kuota/rate-limit dari berbagai kemungkinan exception (Gemini & Groq)."""
+    msg = str(exc).lower()
+    keywords = ["resourceexhausted", "resource exhausted", "429", "rate limit", "quota"]
+    return any(k in msg or k in type(exc).__name__.lower() for k in keywords)
 
 # ------------------------------------------------------------------
 # KONFIGURASI HALAMAN
@@ -82,8 +100,9 @@ with st.sidebar:
     )
     gemini_model_name = st.selectbox(
         "Model Vision Agent (Gemini)",
-        ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"],
         index=0,
+        help="Jika sering kena 'kuota habis', coba pilih gemini-1.5-flash-8b (limit lebih longgar).",
     )
 
     st.divider()
@@ -108,18 +127,59 @@ if "messages" not in st.session_state:
 # AGENT 1: VISION AGENT (GEMINI)
 # ------------------------------------------------------------------
 def run_vision_agent(image: Image.Image, api_key: str, model_name: str) -> str:
-    """Menganalisis foto tanaman secara objektif menggunakan Gemini."""
+    """
+    Menganalisis foto tanaman secara objektif menggunakan Gemini.
+    Dilengkapi retry dengan exponential backoff, dan fallback otomatis
+    ke model Gemini yang lebih ringan jika model utama kena rate-limit/kuota habis.
+    """
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=VISION_AGENT_PROMPT,
+
+    # susun urutan model yang dicoba: model pilihan user dulu, baru fallback lainnya
+    models_to_try = [model_name] + [m for m in GEMINI_FALLBACK_CHAIN if m != model_name]
+
+    last_error = None
+    for model_candidate in models_to_try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                model = genai.GenerativeModel(
+                    model_name=model_candidate,
+                    system_instruction=VISION_AGENT_PROMPT,
+                )
+                response = model.generate_content(
+                    [image, "Amati dan laporkan kondisi visual tanaman pada gambar ini."]
+                )
+                return response.text.strip()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if _is_rate_limit_error(exc):
+                    if attempt < MAX_RETRIES:
+                        wait_s = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                        st.toast(
+                            f"⏳ Kuota/rate-limit Gemini ({model_candidate}) tercapai. "
+                            f"Coba lagi dalam {wait_s}s (percobaan {attempt}/{MAX_RETRIES})...",
+                            icon="⏳",
+                        )
+                        time.sleep(wait_s)
+                        continue
+                    else:
+                        # habis percobaan untuk model ini -> lanjut ke model fallback berikutnya
+                        st.toast(
+                            f"🔁 Model {model_candidate} masih kena limit, "
+                            f"beralih ke model cadangan...",
+                            icon="🔁",
+                        )
+                        break
+                else:
+                    # error selain rate-limit -> langsung lempar, tidak perlu fallback
+                    raise
+
+    # semua model & percobaan gagal karena rate-limit/kuota
+    raise RuntimeError(
+        "QUOTA_EXHAUSTED: Semua model Gemini yang dicoba mengalami rate-limit/kuota habis. "
+        f"Detail error terakhir: {last_error}"
     )
-    response = model.generate_content(
-        [image, "Amati dan laporkan kondisi visual tanaman pada gambar ini."]
-    )
-    return response.text.strip()
 
 
 # ------------------------------------------------------------------
@@ -132,7 +192,11 @@ def run_diagnosis_agent(
     model_name: str,
     history: list,
 ) -> str:
-    """Menyusun Kartu Diagnosis final berdasarkan gejala teks + hasil vision agent."""
+    """
+    Menyusun Kartu Diagnosis final berdasarkan gejala teks + hasil vision agent.
+    Dilengkapi retry dengan exponential backoff, dan fallback otomatis
+    ke model Groq lain jika model utama kena rate-limit/kuota habis.
+    """
     from groq import Groq
 
     client = Groq(api_key=api_key)
@@ -158,13 +222,45 @@ def run_diagnosis_agent(
 
     messages.append({"role": "user", "content": combined_context})
 
-    completion = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        temperature=0.4,
-        max_tokens=1800,
+    models_to_try = [model_name] + [m for m in GROQ_FALLBACK_CHAIN if m != model_name]
+
+    last_error = None
+    for model_candidate in models_to_try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                completion = client.chat.completions.create(
+                    model=model_candidate,
+                    messages=messages,
+                    temperature=0.4,
+                    max_tokens=1800,
+                )
+                return completion.choices[0].message.content.strip()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if _is_rate_limit_error(exc):
+                    if attempt < MAX_RETRIES:
+                        wait_s = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                        st.toast(
+                            f"⏳ Kuota/rate-limit Groq ({model_candidate}) tercapai. "
+                            f"Coba lagi dalam {wait_s}s (percobaan {attempt}/{MAX_RETRIES})...",
+                            icon="⏳",
+                        )
+                        time.sleep(wait_s)
+                        continue
+                    else:
+                        st.toast(
+                            f"🔁 Model {model_candidate} masih kena limit, "
+                            f"beralih ke model cadangan...",
+                            icon="🔁",
+                        )
+                        break
+                else:
+                    raise
+
+    raise RuntimeError(
+        "QUOTA_EXHAUSTED: Semua model Groq yang dicoba mengalami rate-limit/kuota habis. "
+        f"Detail error terakhir: {last_error}"
     )
-    return completion.choices[0].message.content.strip()
 
 
 # ------------------------------------------------------------------
@@ -177,19 +273,48 @@ def orchestrate(user_text, image, groq_key, gemini_key, groq_model, gemini_model
         if not gemini_key:
             st.error("⚠️ Mohon isi Gemini API Key di sidebar untuk menganalisis gambar.")
             return None
-        with st.status("🖼️ Vision Agent (Gemini) sedang mengamati gambar...", expanded=False):
-            vision_result = run_vision_agent(image, gemini_key, gemini_model)
+        try:
+            with st.status("🖼️ Vision Agent (Gemini) sedang mengamati gambar...", expanded=False):
+                vision_result = run_vision_agent(image, gemini_key, gemini_model)
+        except Exception as exc:  # noqa: BLE001
+            if _is_rate_limit_error(exc):
+                st.error(
+                    "🚫 **Kuota Gemini API habis** (Resource Exhausted).\n\n"
+                    "Kemungkinan penyebab:\n"
+                    "- Batas gratis Gemini API (per menit/hari) sudah tercapai\n"
+                    "- Terlalu banyak request dalam waktu singkat\n\n"
+                    "**Solusi:**\n"
+                    "- Tunggu beberapa saat lalu coba lagi\n"
+                    "- Cek kuota di https://aistudio.google.com/app/apikey\n"
+                    "- Atau lanjutkan tanpa foto — ketik gejala dalam bentuk teks saja, "
+                    "Diagnosis Agent (Groq) tetap bisa bekerja tanpa Vision Agent."
+                )
+            else:
+                st.error(f"❌ Vision Agent (Gemini) mengalami error: {exc}")
+            return None
 
     if not groq_key:
         st.error("⚠️ Mohon isi Groq API Key di sidebar untuk menyusun diagnosis.")
         return None
 
-    with st.status("🩺 Diagnosis Agent (Groq) sedang menyusun Kartu Diagnosis...", expanded=False):
-        final_result = run_diagnosis_agent(
-            user_text, vision_result, groq_key, groq_model, history
-        )
-
-    return final_result
+    try:
+        with st.status("🩺 Diagnosis Agent (Groq) sedang menyusun Kartu Diagnosis...", expanded=False):
+            final_result = run_diagnosis_agent(
+                user_text, vision_result, groq_key, groq_model, history
+            )
+        return final_result
+    except Exception as exc:  # noqa: BLE001
+        if _is_rate_limit_error(exc):
+            st.error(
+                "🚫 **Kuota Groq API habis** (Rate Limit / Resource Exhausted).\n\n"
+                "**Solusi:**\n"
+                "- Tunggu beberapa saat lalu coba lagi\n"
+                "- Cek kuota di https://console.groq.com/settings/limits\n"
+                "- Coba ganti model di sidebar (misal ke `llama-3.1-8b-instant`)"
+            )
+        else:
+            st.error(f"❌ Diagnosis Agent (Groq) mengalami error: {exc}")
+        return None
 
 
 # ------------------------------------------------------------------
